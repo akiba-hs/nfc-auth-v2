@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
@@ -19,7 +17,7 @@ use esp_idf_hal::units::Hertz;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::log::EspLogger;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::{error, info, warn};
 use pn532::i2c::I2CInterface;
@@ -36,8 +34,6 @@ mod build_config {
 
 use build_config::{BOT_TOKEN, GIST_URL, WIFI_PASS, WIFI_SSID};
 
-const SAFE_MODE_PATH: &str = "/safemode.json";
-const KEYS_PATH: &str = "/keys.json";
 const TELEGRAM_PRIVATE_CHAT_ID: &str = "-1001521238614";
 const TELEGRAM_PUBLIC_CHAT_ID: &str = "-1001742786420";
 const PN532_BUFFER: usize = 128;
@@ -45,6 +41,9 @@ const LISTEN_TIMEOUT_MS: u64 = 1000;
 const WATCHDOG_TIMEOUT_SECS: u64 = 60;
 const UID_REPEAT_SUPPRESSION_SECS: u64 = 10;
 const PN532_RETRY_DELAY_MS: u64 = 50;
+const NVS_NAMESPACE: &str = "akiba";
+const NVS_KEYS_KEY: &str = "uids";
+const NVS_MAX_CACHE_SIZE: usize = 8192;
 
 fn main() {
     if let Err(err) = app_main() {
@@ -61,15 +60,11 @@ fn app_main() -> Result<()> {
 
     init_watchdog(Duration::from_secs(WATCHDOG_TIMEOUT_SECS))?;
 
-    let safe_mode_reason = read_safemode_reason();
     let reset_reason = describe_reset_reason();
 
     let (mut app, uid_count) = App::new(BOT_TOKEN, GIST_URL, WIFI_SSID, WIFI_PASS)?;
 
-    app.send_startup_message(&safe_mode_reason, &reset_reason);
-    if let Err(err) = clear_safemode_file() {
-        warn!("Failed to remove {}: {:?}", SAFE_MODE_PATH, err);
-    }
+    app.send_startup_message(&reset_reason);
     app.send_loaded_message(uid_count);
     app.run();
 
@@ -82,6 +77,7 @@ struct App {
     http: HttpClient<EspHttpConnection>,
     pn532: Pn532<I2CInterface<I2cDriver<'static>>, MonoTimer, PN532_BUFFER>,
     unlock_uart: UartDriver<'static>,
+    nvs: EspDefaultNvs,
     uids: HashMap<String, String>,
     last_uid: Option<String>,
     last_seen: Instant,
@@ -100,13 +96,19 @@ impl App {
         let pins = peripherals.pins;
 
         let sys_loop = EspSystemEventLoop::take()?;
-        let nvs = EspDefaultNvsPartition::take()?;
+        let nvs_partition = EspDefaultNvsPartition::take()?;
 
         let mut wifi = BlockingWifi::wrap(
-            EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+            EspWifi::new(
+                peripherals.modem,
+                sys_loop.clone(),
+                Some(nvs_partition.clone()),
+            )?,
             sys_loop,
         )?;
         connect_wifi(&mut wifi, wifi_ssid, wifi_pass)?;
+
+        let nvs: EspDefaultNvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
 
         let http_config = HttpConfiguration {
             timeout: Some(Duration::from_secs(3)),
@@ -138,6 +140,7 @@ impl App {
             http,
             pn532,
             unlock_uart,
+            nvs,
             uids: HashMap::new(),
             last_uid: None,
             last_seen: Instant::now(),
@@ -160,8 +163,8 @@ impl App {
                 Ok(Some(uid)) => {
                     fail_counter = 0;
                     self.handle_uid(uid);
-                },
-                Ok(None) => { fail_counter = 0 }
+                }
+                Ok(None) => fail_counter = 0,
                 Err(err) => {
                     fail_counter += 1;
                     warn!("listen failed: {err}");
@@ -185,10 +188,8 @@ impl App {
         }
     }
 
-    fn send_startup_message(&mut self, safe_mode_reason: &str, reset_reason: &str) {
-        let message = format!(
-            "initializing, safe mode reason was: {safe_mode_reason}, reset reason: {reset_reason}"
-        );
+    fn send_startup_message(&mut self, reset_reason: &str) {
+        let message = format!("initializing, reset reason: {reset_reason}");
         self.send_message(&message, true);
     }
 
@@ -250,18 +251,56 @@ impl App {
             Ok(uids) => {
                 info!("Loaded {} NFC identities from gist", uids.len());
                 self.uids = uids;
-                if let Err(err) = save_uids(&self.uids) {
+                if let Err(err) = self.save_uids_cache() {
                     warn!("failed to cache keys: {err}");
                 }
             }
             Err(fetch_err) => {
                 warn!("Failed to fetch NFC identities: {fetch_err}");
-                self.uids = load_cached_uids()?;
-                info!("Loaded {} NFC identities from cache", self.uids.len());
+                match self.load_uids_from_cache()? {
+                    Some(cached) => {
+                        self.uids = cached;
+                        info!("Loaded {} NFC identities from cache", self.uids.len());
+                    }
+                    None => {
+                        warn!("No cached NFC identities available in NVS");
+                        return Err(fetch_err);
+                    }
+                }
             }
         }
 
         Ok(self.uids.len())
+    }
+
+    fn save_uids_cache(&mut self) -> Result<()> {
+        let json = serde_json::to_vec(&self.uids)?;
+        if json.len() > NVS_MAX_CACHE_SIZE {
+            anyhow::bail!(
+                "UID cache ({}) exceeds NVS buffer size {}",
+                json.len(),
+                NVS_MAX_CACHE_SIZE
+            );
+        }
+        self.nvs
+            .set_raw(NVS_KEYS_KEY, &json)
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    fn load_uids_from_cache(&self) -> Result<Option<HashMap<String, String>>> {
+        let mut buf = vec![0u8; NVS_MAX_CACHE_SIZE];
+        match self
+            .nvs
+            .get_raw(NVS_KEYS_KEY, &mut buf)
+            .map_err(anyhow::Error::from)?
+        {
+            Some(data) => {
+                let parsed = serde_json::from_slice(data)?;
+                Ok(Some(parsed))
+            }
+            None => Ok(None),
+        }
     }
 
     fn initialize_pn532(&mut self) -> Result<()> {
@@ -396,20 +435,6 @@ fn fetch_uids(
     Ok(parsed)
 }
 
-fn save_uids(uids: &HashMap<String, String>) -> Result<()> {
-    let json = serde_json::to_string(uids)?;
-    fs::write(KEYS_PATH, json)?;
-    Ok(())
-}
-
-fn load_cached_uids() -> Result<HashMap<String, String>> {
-    let data = fs::read_to_string(KEYS_PATH)
-        .map_err(|err| anyhow!("failed to read {KEYS_PATH}: {err}"))?;
-    let map =
-        serde_json::from_str(&data).map_err(|err| anyhow!("failed to parse {KEYS_PATH}: {err}"))?;
-    Ok(map)
-}
-
 fn unlock(uart: &UartDriver<'static>) -> Result<()> {
     uart.clear_rx()?;
     let written = uart.write(&[b'u'])?;
@@ -453,17 +478,6 @@ fn feed_watchdog() {
             warn!("failed to feed watchdog: {:?}", err);
         }
     }
-}
-
-fn read_safemode_reason() -> String {
-    fs::read_to_string(SAFE_MODE_PATH).unwrap_or_else(|err| format!("read error: {err}"))
-}
-
-fn clear_safemode_file() -> Result<()> {
-    if Path::new(SAFE_MODE_PATH).exists() {
-        fs::remove_file(SAFE_MODE_PATH)?;
-    }
-    Ok(())
 }
 
 fn describe_reset_reason() -> String {
