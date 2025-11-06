@@ -1,0 +1,4 @@
+bot_token = "<token-here>"
+gist_url = "<raw-json-url-here>"
+wifi_ssid = "Akiba Hackspace (slow 2.4 GHz)"
+wifi_pass = "<wifi-password-here>"
