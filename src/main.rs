@@ -41,7 +41,7 @@ const KEYS_PATH: &str = "/keys.json";
 const TELEGRAM_PRIVATE_CHAT_ID: &str = "-1001521238614";
 const TELEGRAM_PUBLIC_CHAT_ID: &str = "-1001742786420";
 const PN532_BUFFER: usize = 128;
-const LISTEN_TIMEOUT_MS: u64 = 500;
+const LISTEN_TIMEOUT_MS: u64 = 1000;
 const WATCHDOG_TIMEOUT_SECS: u64 = 60;
 const UID_REPEAT_SUPPRESSION_SECS: u64 = 10;
 const PN532_RETRY_DELAY_MS: u64 = 50;
@@ -152,17 +152,27 @@ impl App {
     }
 
     fn run(&mut self) -> ! {
+        let mut fail_counter = 0;
         loop {
             feed_watchdog();
 
             match self.listen_once() {
-                Ok(Some(uid)) => self.handle_uid(uid),
-                Ok(None) => {}
+                Ok(Some(uid)) => {
+                    fail_counter = 0;
+                    self.handle_uid(uid);
+                },
+                Ok(None) => { fail_counter = 0 }
                 Err(err) => {
+                    fail_counter += 1;
                     warn!("listen failed: {err}");
-                    self.send_message(&format!("listen failed: {err}"), true);
+                    if fail_counter > 10 {
+                        fail_counter = 0;
+                        self.send_message(&format!("listen failed: {err}"), true);
+                    }
                     if let Err(init_err) = self.initialize_pn532() {
                         warn!("failed to reinitialize PN532: {init_err}");
+                    } else {
+                        fail_counter = 0;
                     }
                 }
             }
