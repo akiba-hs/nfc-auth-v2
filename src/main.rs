@@ -130,6 +130,8 @@ impl App {
 
         let i2c_config = i2c::config::Config::new()
             .baudrate(Hertz(10_000))
+            .scl_enable_pullup(false)
+            .sda_enable_pullup(false)
             .timeout(APBTickType::from(Duration::from_millis(10)));
         let i2c = I2cDriver::new(peripherals.i2c0, pins.gpio21, pins.gpio22, &i2c_config)?;
 
@@ -168,6 +170,7 @@ impl App {
                 Err(err) => {
                     fail_counter += 1;
                     warn!("listen failed: {err}");
+                    thread::sleep(Duration::from_millis(1000));
                     if fail_counter > 10 {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true);
