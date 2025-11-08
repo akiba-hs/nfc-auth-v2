@@ -9,7 +9,7 @@ use core::ptr;
 use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
 use esp_idf_hal::delay::TickType;
-use esp_idf_hal::gpio::AnyIOPin;
+use esp_idf_hal::gpio::{AnyIOPin, Gpio19, Output, PinDriver};
 use esp_idf_hal::i2c::{self, APBTickType, I2cDriver};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::uart::{self, UartDriver};
@@ -78,6 +78,7 @@ struct App {
     pn532: Pn532<I2CInterface<I2cDriver<'static>>, MonoTimer, PN532_BUFFER>,
     unlock_uart: UartDriver<'static>,
     nvs: EspDefaultNvs,
+    pn_power: PinDriver<'static, Gpio19, Output>,
     uids: HashMap<String, String>,
     last_uid: Option<String>,
     last_seen: Instant,
@@ -94,6 +95,12 @@ impl App {
     ) -> Result<(Self, usize)> {
         let peripherals = Peripherals::take().context("Failed to take peripherals")?;
         let pins = peripherals.pins;
+
+        let mut pn_power = PinDriver::output(pins.gpio19)?;
+        pn_power.set_low()?;
+        thread::sleep(Duration::from_millis(100));
+        pn_power.set_high()?;
+        thread::sleep(Duration::from_millis(100));
 
         let sys_loop = EspSystemEventLoop::take()?;
         let nvs_partition = EspDefaultNvsPartition::take()?;
@@ -121,7 +128,7 @@ impl App {
         let unlock_uart = UartDriver::new(
             peripherals.uart1,
             pins.gpio18,
-            pins.gpio19,
+            pins.gpio13,
             Option::<AnyIOPin>::None,
             Option::<AnyIOPin>::None,
             &unlock_uart_config,
@@ -143,6 +150,7 @@ impl App {
             pn532,
             unlock_uart,
             nvs,
+            pn_power,
             uids: HashMap::new(),
             last_uid: None,
             last_seen: Instant::now(),
@@ -170,7 +178,6 @@ impl App {
                 Err(err) => {
                     fail_counter += 1;
                     warn!("listen failed: {err}");
-                    thread::sleep(Duration::from_millis(1000));
                     if fail_counter > 10 {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true);
@@ -308,6 +315,10 @@ impl App {
 
     fn initialize_pn532(&mut self) -> Result<()> {
         loop {
+            self.pn_power.set_low()?;
+            thread::sleep(Duration::from_millis(250));
+            self.pn_power.set_high()?;
+            thread::sleep(Duration::from_millis(250));
             match self
                 .pn532
                 .process(&Request::GET_FIRMWARE_VERSION, 4, 1000_u64.ms())
@@ -321,20 +332,18 @@ impl App {
                             data.len()
                         );
                     }
-                    break;
                 }
                 Err(err) => {
                     warn!("Error connecting to PN532: {:?}", err);
                     thread::sleep(Duration::from_millis(PN532_RETRY_DELAY_MS));
+                    continue;
                 }
             }
-        }
 
-        loop {
             match self.pn532.process(
                 &Request::sam_configuration(SAMMode::Normal, false),
                 0,
-                50_u64.ms(),
+                1000_u64.ms(),
             ) {
                 Ok(_) => break,
                 Err(err) => {
