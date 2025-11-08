@@ -40,7 +40,7 @@ const PN532_BUFFER: usize = 128;
 const LISTEN_TIMEOUT_MS: u64 = 1000;
 const WATCHDOG_TIMEOUT_SECS: u64 = 60;
 const UID_REPEAT_SUPPRESSION_SECS: u64 = 10;
-const PN532_RETRY_DELAY_MS: u64 = 50;
+const PN532_RETRY_DELAY_MS: u64 = 500;
 const NVS_NAMESPACE: &str = "akiba";
 const NVS_KEYS_KEY: &str = "uids";
 const NVS_MAX_CACHE_SIZE: usize = 8192;
@@ -459,7 +459,7 @@ fn init_watchdog(timeout: Duration) -> Result<()> {
     let config = sys::esp_task_wdt_config_t {
         timeout_ms,
         idle_core_mask: core_mask,
-        trigger_panic: false,
+        trigger_panic: true,
     };
 
     unsafe {
