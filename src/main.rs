@@ -15,7 +15,7 @@ use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::uart::{self, UartDriver};
 use esp_idf_hal::units::Hertz;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
+use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection, FollowRedirectsPolicy};
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
@@ -44,6 +44,18 @@ const PN532_RETRY_DELAY_MS: u64 = 500;
 const NVS_NAMESPACE: &str = "akiba";
 const NVS_KEYS_KEY: &str = "uids";
 const NVS_MAX_CACHE_SIZE: usize = 8192;
+
+const HTTP_CONFIG: HttpConfiguration = HttpConfiguration {
+    timeout: Some(Duration::from_secs(3)),
+    crt_bundle_attach: Some(sys::esp_crt_bundle_attach),
+    buffer_size: None,
+    buffer_size_tx: None,
+    follow_redirects_policy: FollowRedirectsPolicy::FollowGetHead,
+    client_certificate: None,
+    private_key: None,
+    use_global_ca_store: false,
+    raw_request_body: false,
+};
 
 fn main() {
     if let Err(err) = app_main() {
@@ -74,7 +86,6 @@ fn app_main() -> Result<()> {
 
 struct App {
     wifi: BlockingWifi<EspWifi<'static>>,
-    http: HttpClient<EspHttpConnection>,
     pn532: Pn532<I2CInterface<I2cDriver<'static>>, MonoTimer, PN532_BUFFER>,
     unlock_uart: UartDriver<'static>,
     nvs: EspDefaultNvs,
@@ -117,13 +128,6 @@ impl App {
 
         let nvs: EspDefaultNvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
 
-        let http_config = HttpConfiguration {
-            timeout: Some(Duration::from_secs(3)),
-            crt_bundle_attach: Some(sys::esp_crt_bundle_attach),
-            ..Default::default()
-        };
-        let http = HttpClient::wrap(EspHttpConnection::new(&http_config)?);
-
         let unlock_uart_config = uart::config::Config::new().baudrate(Hertz(9_600));
         let unlock_uart = UartDriver::new(
             peripherals.uart1,
@@ -146,7 +150,6 @@ impl App {
 
         let mut app = App {
             wifi,
-            http,
             pn532,
             unlock_uart,
             nvs,
@@ -198,12 +201,12 @@ impl App {
         }
     }
 
-    fn send_startup_message(&mut self, reset_reason: &str) {
+    fn send_startup_message(&self, reset_reason: &str) {
         let message = format!("initializing, reset reason: {reset_reason}");
         self.send_message(&message, true);
     }
 
-    fn send_loaded_message(&mut self, count: usize) {
+    fn send_loaded_message(&self, count: usize) {
         self.send_message(&format!("initializing done, loaded {count} uids"), true);
     }
 
@@ -249,15 +252,15 @@ impl App {
         self.last_seen = now;
     }
 
-    fn send_message(&mut self, message: &str, private: bool) {
+    fn send_message(&self, message: &str, private: bool) {
         info!("TG > {message}");
-        if let Err(err) = send_telegram(&mut self.http, &self.bot_token, message, private) {
+        if let Err(err) = send_telegram(&self.bot_token, message, private) {
             warn!("telegram error: {err}");
         }
     }
 
     fn refresh_uids(&mut self) -> Result<usize> {
-        match fetch_uids(&mut self.http, &self.gist_url) {
+        match fetch_uids(&self.gist_url) {
             Ok(uids) => {
                 info!("Loaded {} NFC identities from gist", uids.len());
                 self.uids = uids;
@@ -391,11 +394,11 @@ fn connect_wifi(
 }
 
 fn send_telegram(
-    client: &mut HttpClient<EspHttpConnection>,
     bot_token: &str,
     message: &str,
     private: bool,
 ) -> Result<()> {
+    let mut client = HttpClient::wrap(EspHttpConnection::new(&HTTP_CONFIG)?);
     let chat_id = if private {
         TELEGRAM_PRIVATE_CHAT_ID
     } else {
@@ -425,9 +428,9 @@ fn send_telegram(
 }
 
 fn fetch_uids(
-    client: &mut HttpClient<EspHttpConnection>,
     url: &str,
 ) -> Result<HashMap<String, String>> {
+    let mut client = HttpClient::wrap(EspHttpConnection::new(&HTTP_CONFIG)?);
     let request = client.request(Method::Get, url, &[])?;
     let mut response = request.submit()?;
 
