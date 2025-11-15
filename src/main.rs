@@ -124,7 +124,10 @@ impl App {
             )?,
             sys_loop,
         )?;
-        connect_wifi(&mut wifi, wifi_ssid, wifi_pass)?;
+        
+        if let Err(e) = connect_wifi(&mut wifi, wifi_ssid, wifi_pass) {
+            warn!("wifi connect fail: {e:?}");
+        }
 
         let nvs: EspDefaultNvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
 
