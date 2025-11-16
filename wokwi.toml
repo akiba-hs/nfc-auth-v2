@@ -1,0 +1,5 @@
+[wokwi]
+version = 1
+firmware = "target/xtensa-esp32-espidf/release/akiba-nfc-auth-v2"
+elf = "target/xtensa-esp32-espidf/release/akiba-nfc-auth-v2"
+diagram = "diagram.json"
