@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
 use esp_idf_hal::delay::TickType;
-use esp_idf_hal::gpio::{AnyIOPin, Gpio0, Gpio19, Input, Output, PinDriver, Pull};
+use esp_idf_hal::gpio::{AnyIOPin, Gpio0, Gpio19, Gpio2, Input, Output, PinDriver, Pull};
 use esp_idf_hal::i2c::{self, APBTickType, I2cDriver};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::uart::{self, UartDriver};
@@ -366,6 +366,7 @@ struct App {
     unlock_uart: UartDriver<'static>,
     nvs: EspDefaultNvs,
     pn_power: PinDriver<'static, Gpio19, Output>,
+    status_led: PinDriver<'static, Gpio2, Output>,
     boot_button: PinDriver<'static, Gpio0, Input>,
     uids: HashMap<String, String>,
     last_uid: Option<String>,
@@ -387,6 +388,8 @@ impl App {
         let pins = peripherals.pins;
 
         let pn_power = PinDriver::output(pins.gpio19)?;
+        let mut status_led = PinDriver::output(pins.gpio2)?;
+        status_led.set_high()?;
         let mut boot_button = PinDriver::input(pins.gpio0)?;
         boot_button.set_pull(Pull::Up)?;
 
@@ -433,6 +436,7 @@ impl App {
             unlock_uart,
             nvs,
             pn_power,
+            status_led,
             boot_button,
             uids: HashMap::new(),
             last_uid: None,
@@ -450,10 +454,17 @@ impl App {
     fn run(&mut self) -> ! {
         self.initialize_pn532();
         let mut fail_counter = 0;
+        let mut success_counter = 0;
         let mut last_log = Instant::now();
         loop {
-            match self.listen_once() {
+            let listen_result = self.listen_once();
+            match listen_result {
                 Ok(maybe_uid) => {
+                    success_counter += 1;
+                    if success_counter > 10 {
+                        success_counter = 0;
+                        self.led_toggle();
+                    }
                     fail_counter = 0;
                     if let Some(uid) = maybe_uid {
                         self.handle_uid(uid);
@@ -466,12 +477,14 @@ impl App {
                 }
                 Err(err) => {
                     fail_counter += 1;
+                    success_counter = 0;
                     warn!("listen failed: {err}");
                     if fail_counter > 10 {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true, true);
                         self.initialize_pn532();
                     }
+                    self.led_off();
                     thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -527,6 +540,14 @@ impl App {
 
         self.last_uid = Some(uid_hex);
         self.last_seen = now;
+    }
+
+    fn led_off(&mut self) {
+        let _ = self.status_led.set_low();
+    }
+
+    fn led_toggle(&mut self) {
+        let _ = self.status_led.toggle();
     }
 
     fn check_manual_reboot(&mut self) {
