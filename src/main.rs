@@ -106,11 +106,7 @@ impl App {
         let peripherals = Peripherals::take().context("Failed to take peripherals")?;
         let pins = peripherals.pins;
 
-        let mut pn_power = PinDriver::output(pins.gpio19)?;
-        pn_power.set_low()?;
-        thread::sleep(Duration::from_millis(100));
-        pn_power.set_high()?;
-        thread::sleep(Duration::from_millis(100));
+        let pn_power = PinDriver::output(pins.gpio19)?;
 
         let sys_loop = EspSystemEventLoop::take()?;
         let nvs_partition = EspDefaultNvsPartition::take()?;
@@ -163,13 +159,13 @@ impl App {
             gist_url,
         };
 
-        app.initialize_pn532()?;
         let count = app.refresh_uids()?;
 
         Ok((app, count))
     }
 
     fn run(&mut self) -> ! {
+        self.initialize_pn532();
         let mut fail_counter = 0;
         loop {
             match self.listen_once() {
@@ -189,9 +185,7 @@ impl App {
                     if fail_counter > 10 {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true);
-                        if let Err(init_err) = self.initialize_pn532() {
-                            warn!("failed to reinitialize PN532: {init_err}");
-                        }
+                        self.initialize_pn532();
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
@@ -309,11 +303,11 @@ impl App {
         }
     }
 
-    fn initialize_pn532(&mut self) -> Result<()> {
+    fn initialize_pn532(&mut self) {
         loop {
-            self.pn_power.set_low()?;
+            let _ = self.pn_power.set_low();
             thread::sleep(Duration::from_millis(250));
-            self.pn_power.set_high()?;
+            let _ = self.pn_power.set_high();
             thread::sleep(Duration::from_millis(250));
             match self
                 .pn532
@@ -348,8 +342,6 @@ impl App {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
