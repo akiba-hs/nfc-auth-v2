@@ -76,8 +76,7 @@ fn app_main() -> Result<()> {
 
     let (mut app, uid_count) = App::new(BOT_TOKEN, GIST_URL, WIFI_SSID, WIFI_PASS)?;
 
-    app.send_startup_message(&reset_reason);
-    app.send_loaded_message(uid_count);
+    app.send_loaded_message(&reset_reason, uid_count);
     app.run();
 
     #[allow(unreachable_code)]
@@ -204,13 +203,8 @@ impl App {
         }
     }
 
-    fn send_startup_message(&self, reset_reason: &str) {
-        let message = format!("initializing, reset reason: {reset_reason}");
-        self.send_message(&message, true);
-    }
-
-    fn send_loaded_message(&self, count: usize) {
-        self.send_message(&format!("initializing done, loaded {count} uids"), true);
+    fn send_loaded_message(&self, reset_reason: &str, count: usize) {
+        self.send_message(&format!("initializing done\nreset reason: {reset_reason}\nloaded {count} uids"), true);
     }
 
     fn listen_once(&mut self) -> Result<Option<Vec<u8>>> {
