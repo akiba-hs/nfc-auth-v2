@@ -172,34 +172,30 @@ impl App {
     fn run(&mut self) -> ! {
         let mut fail_counter = 0;
         loop {
-            feed_watchdog();
-
             match self.listen_once() {
-                Ok(Some(uid)) => {
+                Ok(maybe_uid) => {
                     fail_counter = 0;
-                    self.handle_uid(uid);
+                    if let Some(uid) = maybe_uid {
+                        self.handle_uid(uid);
+                    }
+                    feed_watchdog();
+                    if let Ok(ap_info) = self.wifi.wifi_mut().driver_mut().get_ap_info() {
+                        info!(".{}", ap_info.signal_strength);
+                    }
                 }
-                Ok(None) => fail_counter = 0,
                 Err(err) => {
                     fail_counter += 1;
                     warn!("listen failed: {err}");
                     if fail_counter > 10 {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true);
+                        if let Err(init_err) = self.initialize_pn532() {
+                            warn!("failed to reinitialize PN532: {init_err}");
+                        }
                     }
-                    if let Err(init_err) = self.initialize_pn532() {
-                        warn!("failed to reinitialize PN532: {init_err}");
-                    } else {
-                        fail_counter = 0;
-                    }
+                    thread::sleep(Duration::from_millis(100));
                 }
             }
-
-            if let Ok(ap_info) = self.wifi.wifi_mut().driver_mut().get_ap_info() {
-                info!(".{}", ap_info.signal_strength);
-            }
-
-            thread::sleep(Duration::from_millis(100));
         }
     }
 
