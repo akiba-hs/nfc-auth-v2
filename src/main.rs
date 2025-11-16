@@ -165,6 +165,7 @@ impl App {
     fn run(&mut self) -> ! {
         self.initialize_pn532();
         let mut fail_counter = 0;
+        let mut last_log = Instant::now();
         loop {
             match self.listen_once() {
                 Ok(maybe_uid) => {
@@ -173,8 +174,9 @@ impl App {
                         self.handle_uid(uid);
                     }
                     feed_watchdog();
-                    if let Ok(ap_info) = self.wifi.wifi_mut().driver_mut().get_ap_info() {
-                        info!(".{}", ap_info.signal_strength);
+                    if last_log.elapsed() > Duration::from_secs(60) {
+                        info!(".");
+                        last_log = Instant::now();
                     }
                 }
                 Err(err) => {
