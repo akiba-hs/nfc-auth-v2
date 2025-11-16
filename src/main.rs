@@ -60,9 +60,7 @@ const HTTP_CONFIG: HttpConfiguration = HttpConfiguration {
 fn main() {
     if let Err(err) = app_main() {
         error!("Fatal error: {:#}", err);
-        loop {
-            thread::sleep(Duration::from_secs(1));
-        }
+        thread::sleep(Duration::from_secs(1));
     }
 }
 
