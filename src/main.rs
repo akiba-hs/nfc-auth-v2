@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
 use esp_idf_hal::delay::TickType;
-use esp_idf_hal::gpio::{AnyIOPin, Gpio19, Output, PinDriver};
+use esp_idf_hal::gpio::{AnyIOPin, Gpio0, Gpio19, Input, Output, PinDriver, Pull};
 use esp_idf_hal::i2c::{self, APBTickType, I2cDriver};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::uart::{self, UartDriver};
@@ -51,6 +51,7 @@ const NVS_KEYS_KEY: &str = "uids";
 const NVS_MAX_CACHE_SIZE: usize = 8192;
 const WATCHDOG_MONITOR_MARGIN_SECS: u64 = 5;
 const WATCHDOG_MONITOR_POLL_MS: u64 = 500;
+const MANUAL_REBOOT_HOLD_SECS: u64 = 2;
 const LOG_PERIODIC_FLUSH_SECS: u64 = 600;
 const HTTP_RESPONSE_LOG_LIMIT: usize = 8192;
 
@@ -312,12 +313,9 @@ fn spawn_periodic_log_flush() -> Result<()> {
     thread::Builder::new()
         .name("log-flush".into())
         .stack_size(4096)
-        .spawn(move || {
-            thread::sleep(Duration::from_secs(70));
-            loop {
-                telemetry_logger().flush_if_dirty();
-                thread::sleep(interval);
-            }
+        .spawn(move || loop {
+            thread::sleep(interval);
+            telemetry_logger().flush_if_dirty();
         })?;
     Ok(())
 }
@@ -368,9 +366,11 @@ struct App {
     unlock_uart: UartDriver<'static>,
     nvs: EspDefaultNvs,
     pn_power: PinDriver<'static, Gpio19, Output>,
+    boot_button: PinDriver<'static, Gpio0, Input>,
     uids: HashMap<String, String>,
     last_uid: Option<String>,
     last_seen: Instant,
+    reboot_press_started: Option<Instant>,
     bot_token: &'static str,
     gist_url: &'static str,
 }
@@ -387,6 +387,8 @@ impl App {
         let pins = peripherals.pins;
 
         let pn_power = PinDriver::output(pins.gpio19)?;
+        let mut boot_button = PinDriver::input(pins.gpio0)?;
+        boot_button.set_pull(Pull::Up)?;
 
         let sys_loop = EspSystemEventLoop::take()?;
 
@@ -431,9 +433,11 @@ impl App {
             unlock_uart,
             nvs,
             pn_power,
+            boot_button,
             uids: HashMap::new(),
             last_uid: None,
             last_seen: Instant::now(),
+            reboot_press_started: None,
             bot_token,
             gist_url,
         };
@@ -471,6 +475,7 @@ impl App {
                     thread::sleep(Duration::from_millis(100));
                 }
             }
+            self.check_manual_reboot();
         }
     }
 
@@ -522,6 +527,35 @@ impl App {
 
         self.last_uid = Some(uid_hex);
         self.last_seen = now;
+    }
+
+    fn check_manual_reboot(&mut self) {
+        if self.boot_button.is_low() {
+            match self.reboot_press_started {
+                Some(start) => {
+                    if start.elapsed() >= Duration::from_secs(MANUAL_REBOOT_HOLD_SECS) {
+                        self.trigger_soft_reboot("BOOT button");
+                    }
+                }
+                None => {
+                    self.reboot_press_started = Some(Instant::now());
+                }
+            }
+        } else {
+            self.reboot_press_started = None;
+        }
+    }
+
+    #[allow(unreachable_code)]
+    fn trigger_soft_reboot(&self, reason: &str) -> ! {
+        warn!("soft reboot requested: {reason}");
+        self.send_message(&format!("Soft reboot requested ({reason})"), true, true);
+        telemetry_logger().force_flush();
+        thread::sleep(Duration::from_millis(200));
+        unsafe {
+            sys::esp_restart();
+        }
+        unreachable!("esp_restart returned unexpectedly");
     }
 
     fn send_message(&self, message: &str, private: bool, log: bool) {
