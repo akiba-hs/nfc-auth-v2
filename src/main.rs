@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
@@ -6,6 +6,7 @@ use std::vec::Vec;
 use anyhow::{anyhow, Context, Result};
 use core::convert::{Infallible, TryInto};
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
 use esp_idf_hal::delay::TickType;
@@ -15,7 +16,9 @@ use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::uart::{self, UartDriver};
 use esp_idf_hal::units::Hertz;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection, FollowRedirectsPolicy};
+use esp_idf_svc::http::client::{
+    Configuration as HttpConfiguration, EspHttpConnection, FollowRedirectsPolicy,
+};
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
@@ -24,7 +27,9 @@ use pn532::i2c::I2CInterface;
 use pn532::nb;
 use pn532::requests::SAMMode;
 use pn532::{CountDown, Error as PnError, IntoDuration, Pn532, Request};
+use portable_atomic::AtomicU64;
 use serde_json;
+use std::sync::{Mutex, OnceLock};
 
 use esp_idf_svc::sys;
 
@@ -44,18 +49,278 @@ const PN532_RETRY_DELAY_MS: u64 = 500;
 const NVS_NAMESPACE: &str = "akiba";
 const NVS_KEYS_KEY: &str = "uids";
 const NVS_MAX_CACHE_SIZE: usize = 8192;
+const WATCHDOG_MONITOR_MARGIN_SECS: u64 = 5;
+const WATCHDOG_MONITOR_POLL_MS: u64 = 500;
+const LOG_PERIODIC_FLUSH_SECS: u64 = 600;
+const HTTP_RESPONSE_LOG_LIMIT: usize = 8192;
 
 const HTTP_CONFIG: HttpConfiguration = HttpConfiguration {
     timeout: Some(Duration::from_secs(3)),
     crt_bundle_attach: Some(sys::esp_crt_bundle_attach),
-    buffer_size: None,
-    buffer_size_tx: None,
+    buffer_size: Some(16 * 1024),
+    buffer_size_tx: Some(16 * 1024),
     follow_redirects_policy: FollowRedirectsPolicy::FollowGetHead,
     client_certificate: None,
     private_key: None,
     use_global_ca_store: false,
     raw_request_body: false,
 };
+
+const LOG_NAMESPACE: &str = "logbuf";
+const LOG_STORAGE_KEY: &str = "buffer";
+const LOG_BUFFER_CAPACITY: usize = 64;
+const LOG_ENTRY_MAX_LEN: usize = 192;
+const LOG_STORAGE_LIMIT: usize = 3500;
+
+static TELEMETRY_LOGGER: OnceLock<TelemetryLogger> = OnceLock::new();
+static LAST_WDT_FEED_US: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_MONITOR_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+fn telemetry_logger() -> &'static TelemetryLogger {
+    TELEMETRY_LOGGER.get_or_init(TelemetryLogger::new)
+}
+
+unsafe extern "C" fn flush_logs_on_shutdown() {
+    if let Some(logger) = TELEMETRY_LOGGER.get() {
+        logger.flush_on_shutdown();
+    }
+}
+
+struct TelemetryLogger {
+    inner: EspLogger,
+    buffer: Mutex<LogBuffer>,
+    storage: Mutex<Option<EspDefaultNvs>>,
+    panic_hook_installed: AtomicBool,
+}
+
+struct LogBuffer {
+    entries: VecDeque<String>,
+    dirty: bool,
+}
+
+impl LogBuffer {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(LOG_BUFFER_CAPACITY),
+            dirty: false,
+        }
+    }
+}
+
+impl TelemetryLogger {
+    fn new() -> Self {
+        Self {
+            inner: EspLogger::new(),
+            buffer: Mutex::new(LogBuffer::new()),
+            storage: Mutex::new(None),
+            panic_hook_installed: AtomicBool::new(false),
+        }
+    }
+
+    fn install(&'static self, partition: EspDefaultNvsPartition) -> Result<()> {
+        self.ensure_storage(partition)?;
+        log::set_logger(self).map_err(|_| anyhow!("logger already initialized"))?;
+        log::set_max_level(self.inner.get_max_level());
+        self.install_panic_hook();
+        unsafe {
+            sys::esp!(sys::esp_register_shutdown_handler(Some(
+                flush_logs_on_shutdown
+            )))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_storage(&self, partition: EspDefaultNvsPartition) -> Result<()> {
+        let mut guard = self.storage.lock().unwrap();
+        if guard.is_none() {
+            let nvs = EspNvs::new(partition, LOG_NAMESPACE, true)?;
+            *guard = Some(nvs);
+        }
+        Ok(())
+    }
+
+    fn capture(&self, record: &log::Record) {
+        let timestamp = unsafe { sys::esp_log_timestamp() };
+        let mut entry = format!(
+            "{:>10} {} {}: {}",
+            timestamp,
+            record.level(),
+            record.target(),
+            record.args()
+        );
+        if entry.len() > LOG_ENTRY_MAX_LEN {
+            entry.truncate(LOG_ENTRY_MAX_LEN);
+        }
+        let mut buffer = self.buffer.lock().unwrap();
+        if buffer.entries.len() == LOG_BUFFER_CAPACITY {
+            buffer.entries.pop_front();
+        }
+        buffer.entries.push_back(entry);
+        buffer.dirty = true;
+    }
+
+    fn recent_logs(buffer: &LogBuffer) -> String {
+        let mut text = String::new();
+        for entry in buffer.entries.iter().rev() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(entry);
+        }
+        if text.len() > LOG_STORAGE_LIMIT {
+            text.truncate(LOG_STORAGE_LIMIT);
+        }
+        text
+    }
+
+    fn persist_to_nvs(&self) -> Result<()> {
+        info!("persist_to_nvs: enter");
+        let data = {
+            let mut buffer = self.buffer.lock().unwrap();
+            if !buffer.dirty {
+                return Ok(());
+            }
+            buffer.dirty = false;
+            Self::recent_logs(&buffer).into_bytes()
+        };
+
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(nvs) = storage.as_mut() {
+            if data.is_empty() {
+                let _ = nvs.remove(LOG_STORAGE_KEY);
+            } else {
+                nvs.set_raw(LOG_STORAGE_KEY, &data)
+                    .map_err(anyhow::Error::from)?;
+            }
+        }
+        info!("persist_to_nvs: saved {} bytes", data.len());
+
+        Ok(())
+    }
+
+    fn take_persisted_logs(&self) -> Result<Option<String>> {
+        let mut storage = self.storage.lock().unwrap();
+        let Some(nvs) = storage.as_mut() else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; LOG_STORAGE_LIMIT];
+        let data = match nvs
+            .get_raw(LOG_STORAGE_KEY, &mut buf)
+            .map_err(anyhow::Error::from)?
+        {
+            Some(slice) => slice.to_vec(),
+            None => return Ok(None),
+        };
+        let _ = nvs.remove(LOG_STORAGE_KEY);
+        let mut text = String::from_utf8_lossy(&data).into_owned();
+        if text.len() > LOG_STORAGE_LIMIT {
+            text.truncate(LOG_STORAGE_LIMIT);
+        }
+        if text.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(text))
+        }
+    }
+
+    fn flush_on_shutdown(&self) {
+        let _ = self.persist_to_nvs();
+    }
+
+    fn install_panic_hook(&self) {
+        if self.panic_hook_installed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(logger) = TELEMETRY_LOGGER.get() {
+                logger.flush_on_shutdown();
+            }
+            default(info);
+        }));
+    }
+
+    fn force_flush(&self) {
+        if let Err(err) = self.persist_to_nvs() {
+            warn!("failed to persist logs: {err:?}");
+        }
+    }
+
+    fn flush_if_dirty(&self) {
+        let dirty = { self.buffer.lock().unwrap().dirty };
+        if dirty {
+            self.force_flush();
+        }
+    }
+}
+
+impl log::Log for TelemetryLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        <EspLogger as log::Log>::enabled(&self.inner, metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        <EspLogger as log::Log>::log(&self.inner, record);
+        self.capture(record);
+    }
+
+    fn flush(&self) {
+        <EspLogger as log::Log>::flush(&self.inner);
+    }
+}
+
+fn monotonic_micros() -> u64 {
+    unsafe { sys::esp_timer_get_time() as u64 }
+}
+
+fn spawn_watchdog_monitor(timeout: Duration) -> Result<()> {
+    let poll_interval = Duration::from_millis(WATCHDOG_MONITOR_POLL_MS);
+    let margin = Duration::from_secs(WATCHDOG_MONITOR_MARGIN_SECS.min(timeout.as_secs()));
+    let trigger = timeout
+        .checked_sub(margin)
+        .unwrap_or(Duration::from_secs(1));
+    let trigger_us = trigger.as_micros() as u64;
+
+    thread::Builder::new()
+        .name("wdt-monitor".into())
+        .stack_size(4096)
+        .spawn(move || loop {
+            thread::sleep(poll_interval);
+            let last = LAST_WDT_FEED_US.load(Ordering::Relaxed);
+            if last == 0 {
+                continue;
+            }
+            let now = monotonic_micros();
+            let elapsed = now.saturating_sub(last);
+            if elapsed >= trigger_us && !WATCHDOG_MONITOR_TRIGGERED.swap(true, Ordering::SeqCst) {
+                warn!(
+                    "watchdog monitor detected stalled main task after {} us",
+                    elapsed
+                );
+                telemetry_logger().force_flush();
+                unsafe {
+                    sys::esp_restart();
+                }
+            }
+        })?;
+
+    Ok(())
+}
+
+fn spawn_periodic_log_flush() -> Result<()> {
+    let interval = Duration::from_secs(LOG_PERIODIC_FLUSH_SECS);
+    thread::Builder::new()
+        .name("log-flush".into())
+        .stack_size(4096)
+        .spawn(move || {
+            thread::sleep(Duration::from_secs(70));
+            loop {
+                telemetry_logger().flush_if_dirty();
+                thread::sleep(interval);
+            }
+        })?;
+    Ok(())
+}
 
 fn main() {
     if let Err(err) = app_main() {
@@ -66,13 +331,29 @@ fn main() {
 
 fn app_main() -> Result<()> {
     sys::link_patches();
-    EspLogger::initialize_default();
+    let nvs_partition = EspDefaultNvsPartition::take()?;
+    telemetry_logger().install(nvs_partition.clone())?;
+    spawn_periodic_log_flush()?;
 
-    init_watchdog(Duration::from_secs(WATCHDOG_TIMEOUT_SECS))?;
+    let watchdog_timeout = Duration::from_secs(WATCHDOG_TIMEOUT_SECS);
+    init_watchdog(watchdog_timeout)?;
+    spawn_watchdog_monitor(watchdog_timeout)?;
 
     let reset_reason = describe_reset_reason();
 
-    let (mut app, uid_count) = App::new(BOT_TOKEN, GIST_URL, WIFI_SSID, WIFI_PASS)?;
+    let (mut app, uid_count) = App::new(BOT_TOKEN, GIST_URL, WIFI_SSID, WIFI_PASS, nvs_partition)?;
+
+    match telemetry_logger().take_persisted_logs() {
+        Ok(Some(previous_logs)) => {
+            app.send_message(
+                &format!("Recovered logs from previous run:\n{previous_logs}"),
+                true,
+                false,
+            );
+        }
+        Ok(None) => info!("no logs loaded from NVS"),
+        Err(err) => warn!("failed to retrieve persisted logs: {err:?}"),
+    }
 
     app.send_loaded_message(&reset_reason, uid_count);
     app.run();
@@ -100,6 +381,7 @@ impl App {
         gist_url: &'static str,
         wifi_ssid: &'static str,
         wifi_pass: &'static str,
+        nvs_partition: EspDefaultNvsPartition,
     ) -> Result<(Self, usize)> {
         let peripherals = Peripherals::take().context("Failed to take peripherals")?;
         let pins = peripherals.pins;
@@ -107,7 +389,6 @@ impl App {
         let pn_power = PinDriver::output(pins.gpio19)?;
 
         let sys_loop = EspSystemEventLoop::take()?;
-        let nvs_partition = EspDefaultNvsPartition::take()?;
 
         let mut wifi = BlockingWifi::wrap(
             EspWifi::new(
@@ -117,7 +398,7 @@ impl App {
             )?,
             sys_loop,
         )?;
-        
+
         if let Err(e) = connect_wifi(&mut wifi, wifi_ssid, wifi_pass) {
             warn!("wifi connect fail: {e:?}");
         }
@@ -184,7 +465,7 @@ impl App {
                     warn!("listen failed: {err}");
                     if fail_counter > 10 {
                         fail_counter = 0;
-                        self.send_message(&format!("listen failed: {err}"), true);
+                        self.send_message(&format!("listen failed: {err}"), true, true);
                         self.initialize_pn532();
                     }
                     thread::sleep(Duration::from_millis(100));
@@ -194,7 +475,11 @@ impl App {
     }
 
     fn send_loaded_message(&self, reset_reason: &str, count: usize) {
-        self.send_message(&format!("initializing done\nreset reason: {reset_reason}\nloaded {count} uids"), true);
+        self.send_message(
+            &format!("initializing done\nreset reason: {reset_reason}\nloaded {count} uids"),
+            true,
+            true,
+        );
     }
 
     fn listen_once(&mut self) -> Result<Option<Vec<u8>>> {
@@ -230,18 +515,20 @@ impl App {
             if let Err(err) = unlock(&self.unlock_uart) {
                 warn!("failed to unlock: {err}");
             }
-            self.send_message(&format!("[{name}] Authorized via NFC"), false);
+            self.send_message(&format!("[{name}] Authorized via NFC"), false, true);
         } else {
-            self.send_message(&format!("Unknown NFC uid: {uid_hex}"), true);
+            self.send_message(&format!("Unknown NFC uid: {uid_hex}"), true, true);
         }
 
         self.last_uid = Some(uid_hex);
         self.last_seen = now;
     }
 
-    fn send_message(&self, message: &str, private: bool) {
-        info!("TG > {message}");
-        if let Err(err) = send_telegram(&self.bot_token, message, private) {
+    fn send_message(&self, message: &str, private: bool, log: bool) {
+        if log {
+            info!("TG > {message}");
+        }
+        if let Err(err) = send_telegram(&self.bot_token, message, private, log) {
             warn!("telegram error: {err}");
         }
     }
@@ -378,11 +665,7 @@ fn connect_wifi(
     Ok(())
 }
 
-fn send_telegram(
-    bot_token: &str,
-    message: &str,
-    private: bool,
-) -> Result<()> {
+fn send_telegram(bot_token: &str, message: &str, private: bool, log: bool) -> Result<()> {
     let mut client = HttpClient::wrap(EspHttpConnection::new(&HTTP_CONFIG)?);
     let chat_id = if private {
         TELEGRAM_PRIVATE_CHAT_ID
@@ -398,23 +681,40 @@ fn send_telegram(
     let mut response = request.submit()?;
 
     let mut body = Vec::new();
+    let mut truncated = false;
     let mut buffer = [0_u8; 512];
     loop {
         match response.read(&mut buffer) {
             Ok(0) => break,
-            Ok(n) => body.extend_from_slice(&buffer[..n]),
+            Ok(n) => {
+                let remaining = HTTP_RESPONSE_LOG_LIMIT.saturating_sub(body.len());
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                let take = remaining.min(n);
+                body.extend_from_slice(&buffer[..take]);
+                if take < n {
+                    truncated = true;
+                    break;
+                }
+            }
             Err(err) => return Err(anyhow!("http read error: {err}")),
         }
     }
 
-    info!("TG < {}", String::from_utf8_lossy(&body));
+    if log {
+        if truncated {
+            info!("TG < {}... [truncated]", String::from_utf8_lossy(&body));
+        } else {
+            info!("TG < {}", String::from_utf8_lossy(&body));
+        }
+    }
 
     Ok(())
 }
 
-fn fetch_uids(
-    url: &str,
-) -> Result<HashMap<String, String>> {
+fn fetch_uids(url: &str) -> Result<HashMap<String, String>> {
     let mut client = HttpClient::wrap(EspHttpConnection::new(&HTTP_CONFIG)?);
     let request = client.request(Method::Get, url, &[])?;
     let mut response = request.submit()?;
@@ -469,6 +769,7 @@ fn init_watchdog(timeout: Duration) -> Result<()> {
         }
         sys::esp!(sys::esp_task_wdt_add(ptr::null_mut()))?;
     }
+    LAST_WDT_FEED_US.store(monotonic_micros(), Ordering::Relaxed);
     Ok(())
 }
 
@@ -478,6 +779,7 @@ fn feed_watchdog() {
             warn!("failed to feed watchdog: {:?}", err);
         }
     }
+    LAST_WDT_FEED_US.store(monotonic_micros(), Ordering::Relaxed);
 }
 
 fn describe_reset_reason() -> String {
