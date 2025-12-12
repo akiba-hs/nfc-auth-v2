@@ -456,6 +456,7 @@ impl App {
         let mut fail_counter = 0;
         let mut success_counter = 0;
         let mut last_log = Instant::now();
+        let mut last_nfc_reboot = Instant::now();
         loop {
             let listen_result = self.listen_once();
             match listen_result {
@@ -483,11 +484,21 @@ impl App {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true, true);
                         self.initialize_pn532();
+                        last_nfc_reboot = Instant::now(); // Сброс таймера после ребута по ошибке
                     }
                     self.led_off();
                     thread::sleep(Duration::from_millis(100));
                 }
             }
+            
+            // Периодический ребут NFC считывателя (каждые 30 минут)
+            if last_nfc_reboot.elapsed() > Duration::from_secs(30 * 60) {
+                info!("Periodic NFC reader reboot (30 min timer)");
+                // self.send_message("NFC reader periodic reboot (30 min)", true, false); // Отключено: не отправляем в телегу
+                self.initialize_pn532();
+                last_nfc_reboot = Instant::now();
+            }
+            
             self.check_manual_reboot();
         }
     }
