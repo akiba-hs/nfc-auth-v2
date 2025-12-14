@@ -495,7 +495,6 @@ impl App {
                 self.initialize_pn532();
                 last_nfc_reboot = Instant::now();
             }
-            
             self.check_manual_reboot();
         }
     }
