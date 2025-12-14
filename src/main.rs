@@ -484,7 +484,7 @@ impl App {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true, true);
                         self.initialize_pn532();
-                        last_nfc_reboot = Instant::now(); // Сброс таймера после ребута по ошибке
+                        last_nfc_reboot = Instant::now();
                     }
                     self.led_off();
                     thread::sleep(Duration::from_millis(100));
