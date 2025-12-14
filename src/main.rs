@@ -490,8 +490,6 @@ impl App {
                     thread::sleep(Duration::from_millis(100));
                 }
             }
-            
-            // Периодический ребут NFC считывателя (каждые 30 минут)
             if last_nfc_reboot.elapsed() > Duration::from_secs(30 * 60) {
                 info!("Periodic NFC reader reboot (30 min timer)");
                 self.initialize_pn532();
