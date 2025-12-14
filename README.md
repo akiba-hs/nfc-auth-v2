@@ -32,4 +32,7 @@ cargo build --release
 Connect to ESP32 board, flash, and connect to UART for logs:
 ```
 espflash flash target/xtensa-esp32-espidf/release/akiba-nfc-auth-v2 -M -B 115200
+
+sudo ~/.cargo/bin/espflash flash target/xtensa-esp32-espidf/release/akiba-nfc-auth-v2 -M -B 115200
+
 ```

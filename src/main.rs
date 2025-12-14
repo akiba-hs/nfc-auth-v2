@@ -456,6 +456,7 @@ impl App {
         let mut fail_counter = 0;
         let mut success_counter = 0;
         let mut last_log = Instant::now();
+        let mut last_nfc_reboot = Instant::now();
         loop {
             let listen_result = self.listen_once();
             match listen_result {
@@ -483,10 +484,16 @@ impl App {
                         fail_counter = 0;
                         self.send_message(&format!("listen failed: {err}"), true, true);
                         self.initialize_pn532();
+                        last_nfc_reboot = Instant::now();
                     }
                     self.led_off();
                     thread::sleep(Duration::from_millis(100));
                 }
+            }
+            if last_nfc_reboot.elapsed() > Duration::from_secs(30 * 60) {
+                info!("Periodic NFC reader reboot (30 min timer)");
+                self.initialize_pn532();
+                last_nfc_reboot = Instant::now();
             }
             self.check_manual_reboot();
         }
