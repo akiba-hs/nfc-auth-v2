@@ -736,7 +736,7 @@ fn send_telegram(bot_token: &str, message: &str, private: bool, log: bool) -> Re
     };
     let encoded_message = percent_encode(message);
     let url = format!(
-        "https://api.telegram.org/bot{bot_token}/sendMessage?chat_id={chat_id}&text={encoded_message}"
+        "https://tgapi.akiba.space/bot{bot_token}/sendMessage?chat_id={chat_id}&text={encoded_message}"
     );
 
     let request = client.request(Method::Get, &url, &[])?;
