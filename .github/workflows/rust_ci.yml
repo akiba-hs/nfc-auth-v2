@@ -38,5 +38,7 @@ jobs:
           ldproxy: true
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
+      - name: Copy config
+        run: cp app_config.example.toml app_config.toml
       - name: Run command
         run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
