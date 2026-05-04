@@ -30,7 +30,6 @@ use pn532::nb;
 use pn532::requests::SAMMode;
 use pn532::{CountDown, Error as PnError, IntoDuration, Pn532, Request};
 use portable_atomic::AtomicU64;
-use serde_json;
 use std::sync::{Mutex, OnceLock};
 
 use esp_idf_svc::sys;
@@ -620,14 +619,14 @@ impl App {
             warn!("telegram skipped: Wi-Fi is not ready");
             return;
         }
-        if let Err(err) = send_telegram(&self.bot_token, message, private, log) {
+        if let Err(err) = send_telegram(self.bot_token, message, private, log) {
             warn!("telegram error: {err:?}");
         }
     }
 
     fn refresh_uids(&mut self) -> Result<usize> {
         let fetch_result = if self.ensure_wifi_ready("uid refresh") {
-            fetch_uids(&self.gist_url)
+            fetch_uids(self.gist_url)
         } else {
             Err(anyhow!("Wi-Fi is not ready"))
         };
@@ -877,15 +876,17 @@ fn connect_wifi(
         AuthMethod::WPA2Personal
     };
 
-    let mut client_conf = ClientConfiguration::default();
-    client_conf.ssid = ssid
-        .try_into()
-        .map_err(|_| anyhow!("SSID '{ssid}' is too long"))?;
-    client_conf.auth_method = auth_method;
-    client_conf.password = password
-        .try_into()
-        .map_err(|_| anyhow!("Wi-Fi password is too long"))?;
-    client_conf.channel = None;
+    let client_conf = ClientConfiguration {
+        ssid: ssid
+            .try_into()
+            .map_err(|_| anyhow!("SSID '{ssid}' is too long"))?,
+        auth_method,
+        password: password
+            .try_into()
+            .map_err(|_| anyhow!("Wi-Fi password is too long"))?,
+        channel: None,
+        ..Default::default()
+    };
 
     let wifi_configuration = Configuration::Client(client_conf);
 
@@ -963,15 +964,15 @@ fn fetch_uids(url: &str) -> Result<HashMap<String, String>> {
         }
     }
 
-    let parsed: HashMap<String, String> =
-        serde_json::from_slice(&body).map_err(|err| anyhow!("failed to parse gist json: {err:?}"))?;
+    let parsed: HashMap<String, String> = serde_json::from_slice(&body)
+        .map_err(|err| anyhow!("failed to parse gist json: {err:?}"))?;
 
     Ok(parsed)
 }
 
 fn unlock(uart: &UartDriver<'static>) -> Result<()> {
     uart.clear_rx()?;
-    let written = uart.write(&[b'u'])?;
+    let written = uart.write(b"u")?;
     if written != 1 {
         warn!("unexpected bytes written to unlock uart: {written}");
     }
