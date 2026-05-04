@@ -501,10 +501,10 @@ impl App {
                 Err(err) => {
                     fail_counter += 1;
                     success_counter = 0;
-                    warn!("listen failed: {err}");
+                    warn!("listen failed: {err:?}");
                     if fail_counter > 10 {
                         fail_counter = 0;
-                        self.send_message(&format!("listen failed: {err}"), true, true);
+                        self.send_message(&format!("listen failed: {err:?}"), true, true);
                         self.initialize_pn532();
                         last_nfc_reboot = Instant::now();
                     }
@@ -564,7 +564,7 @@ impl App {
 
         if let Some(name) = self.uids.get(&uid_hex).cloned() {
             if let Err(err) = unlock(&self.unlock_uart) {
-                warn!("failed to unlock: {err}");
+                warn!("failed to unlock: {err:?}");
             }
             self.send_message(&format!("[{name}] Authorized via NFC"), false, true);
         } else {
@@ -621,7 +621,7 @@ impl App {
             return;
         }
         if let Err(err) = send_telegram(&self.bot_token, message, private, log) {
-            warn!("telegram error: {err}");
+            warn!("telegram error: {err:?}");
         }
     }
 
@@ -637,7 +637,7 @@ impl App {
                 info!("Loaded {} NFC identities from gist", uids.len());
                 self.uids = uids;
                 if let Err(err) = self.save_uids_cache() {
-                    warn!("failed to cache keys: {err}");
+                    warn!("failed to cache keys: {err:?}");
                 }
             }
             Err(fetch_err) => {
@@ -933,7 +933,7 @@ fn send_telegram(bot_token: &str, message: &str, private: bool, log: bool) -> Re
                     break;
                 }
             }
-            Err(err) => return Err(anyhow!("http read error: {err}")),
+            Err(err) => return Err(anyhow!("http read error: {err:?}")),
         }
     }
 
@@ -959,12 +959,12 @@ fn fetch_uids(url: &str) -> Result<HashMap<String, String>> {
         match response.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => body.extend_from_slice(&buffer[..n]),
-            Err(err) => return Err(anyhow!("failed to read gist response: {err}")),
+            Err(err) => return Err(anyhow!("failed to read gist response: {err:?}")),
         }
     }
 
     let parsed: HashMap<String, String> =
-        serde_json::from_slice(&body).map_err(|err| anyhow!("failed to parse gist json: {err}"))?;
+        serde_json::from_slice(&body).map_err(|err| anyhow!("failed to parse gist json: {err:?}"))?;
 
     Ok(parsed)
 }
