@@ -15,20 +15,21 @@ use esp_idf_hal::i2c::{self, APBTickType, I2cDriver};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::uart::{self, UartDriver};
 use esp_idf_hal::units::Hertz;
-use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::http::client::{
     Configuration as HttpConfiguration, EspHttpConnection, FollowRedirectsPolicy,
 };
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
-use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+use esp_idf_svc::wifi::{
+    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent,
+};
 use log::{error, info, warn};
 use pn532::i2c::I2CInterface;
 use pn532::nb;
 use pn532::requests::SAMMode;
 use pn532::{CountDown, Error as PnError, IntoDuration, Pn532, Request};
 use portable_atomic::AtomicU64;
-use serde_json;
 use std::sync::{Mutex, OnceLock};
 
 use esp_idf_svc::sys;
@@ -54,6 +55,10 @@ const WATCHDOG_MONITOR_POLL_MS: u64 = 500;
 const MANUAL_REBOOT_HOLD_SECS: u64 = 2;
 const LOG_PERIODIC_FLUSH_SECS: u64 = 600;
 const HTTP_RESPONSE_LOG_LIMIT: usize = 8192;
+const WIFI_CHECK_INTERVAL_SECS: u64 = 5;
+const WIFI_RECONNECT_INITIAL_DELAY_SECS: u64 = 2;
+const WIFI_RECONNECT_MAX_DELAY_SECS: u64 = 60;
+const WIFI_CONNECTED_NETIF_GRACE_SECS: u64 = 20;
 
 const HTTP_CONFIG: HttpConfiguration = HttpConfiguration {
     timeout: Some(Duration::from_secs(3)),
@@ -362,6 +367,7 @@ fn app_main() -> Result<()> {
 
 struct App {
     wifi: BlockingWifi<EspWifi<'static>>,
+    _wifi_events: EspSystemSubscription<'static>,
     pn532: Pn532<I2CInterface<I2cDriver<'static>>, MonoTimer, PN532_BUFFER>,
     unlock_uart: UartDriver<'static>,
     nvs: EspDefaultNvs,
@@ -372,8 +378,13 @@ struct App {
     last_uid: Option<String>,
     last_seen: Instant,
     reboot_press_started: Option<Instant>,
+    next_wifi_reconnect: Instant,
+    wifi_reconnect_delay: Duration,
+    wifi_connect_started: Option<Instant>,
+    wifi_was_up: bool,
     bot_token: &'static str,
     gist_url: &'static str,
+    wifi_ssid: &'static str,
 }
 
 impl App {
@@ -401,12 +412,14 @@ impl App {
                 sys_loop.clone(),
                 Some(nvs_partition.clone()),
             )?,
-            sys_loop,
+            sys_loop.clone(),
         )?;
 
+        let wifi_events = subscribe_wifi_events(&sys_loop)?;
         if let Err(e) = connect_wifi(&mut wifi, wifi_ssid, wifi_pass) {
             warn!("wifi connect fail: {e:?}");
         }
+        let wifi_was_up = wifi.is_up().unwrap_or(false);
 
         let nvs: EspDefaultNvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
 
@@ -432,6 +445,7 @@ impl App {
 
         let mut app = App {
             wifi,
+            _wifi_events: wifi_events,
             pn532,
             unlock_uart,
             nvs,
@@ -442,8 +456,13 @@ impl App {
             last_uid: None,
             last_seen: Instant::now(),
             reboot_press_started: None,
+            next_wifi_reconnect: Instant::now(),
+            wifi_reconnect_delay: Duration::from_secs(WIFI_RECONNECT_INITIAL_DELAY_SECS),
+            wifi_connect_started: None,
+            wifi_was_up,
             bot_token,
             gist_url,
+            wifi_ssid,
         };
 
         let count = app.refresh_uids()?;
@@ -457,6 +476,8 @@ impl App {
         let mut success_counter = 0;
         let mut last_log = Instant::now();
         let mut last_nfc_reboot = Instant::now();
+        let mut last_wifi_check = Instant::now();
+        self.ensure_wifi_ready("run startup");
         loop {
             let listen_result = self.listen_once();
             match listen_result {
@@ -479,10 +500,10 @@ impl App {
                 Err(err) => {
                     fail_counter += 1;
                     success_counter = 0;
-                    warn!("listen failed: {err}");
+                    warn!("listen failed: {err:?}");
                     if fail_counter > 10 {
                         fail_counter = 0;
-                        self.send_message(&format!("listen failed: {err}"), true, true);
+                        self.send_message(&format!("listen failed: {err:?}"), true, true);
                         self.initialize_pn532();
                         last_nfc_reboot = Instant::now();
                     }
@@ -495,11 +516,15 @@ impl App {
                 self.initialize_pn532();
                 last_nfc_reboot = Instant::now();
             }
+            if last_wifi_check.elapsed() >= Duration::from_secs(WIFI_CHECK_INTERVAL_SECS) {
+                self.ensure_wifi_ready("periodic check");
+                last_wifi_check = Instant::now();
+            }
             self.check_manual_reboot();
         }
     }
 
-    fn send_loaded_message(&self, reset_reason: &str, count: usize) {
+    fn send_loaded_message(&mut self, reset_reason: &str, count: usize) {
         self.send_message(
             &format!("initializing done\nreset reason: {reset_reason}\nloaded {count} uids"),
             true,
@@ -536,9 +561,9 @@ impl App {
             return;
         }
 
-        if let Some(name) = self.uids.get(&uid_hex) {
+        if let Some(name) = self.uids.get(&uid_hex).cloned() {
             if let Err(err) = unlock(&self.unlock_uart) {
-                warn!("failed to unlock: {err}");
+                warn!("failed to unlock: {err:?}");
             }
             self.send_message(&format!("[{name}] Authorized via NFC"), false, true);
         } else {
@@ -575,7 +600,7 @@ impl App {
     }
 
     #[allow(unreachable_code)]
-    fn trigger_soft_reboot(&self, reason: &str) -> ! {
+    fn trigger_soft_reboot(&mut self, reason: &str) -> ! {
         warn!("soft reboot requested: {reason}");
         self.send_message(&format!("Soft reboot requested ({reason})"), true, true);
         telemetry_logger().force_flush();
@@ -586,22 +611,32 @@ impl App {
         unreachable!("esp_restart returned unexpectedly");
     }
 
-    fn send_message(&self, message: &str, private: bool, log: bool) {
+    fn send_message(&mut self, message: &str, private: bool, log: bool) {
         if log {
             info!("TG > {message}");
         }
-        if let Err(err) = send_telegram(&self.bot_token, message, private, log) {
-            warn!("telegram error: {err}");
+        if !self.ensure_wifi_ready("telegram send") {
+            warn!("telegram skipped: Wi-Fi is not ready");
+            return;
+        }
+        if let Err(err) = send_telegram(self.bot_token, message, private, log) {
+            warn!("telegram error: {err:?}");
         }
     }
 
     fn refresh_uids(&mut self) -> Result<usize> {
-        match fetch_uids(&self.gist_url) {
+        let fetch_result = if self.ensure_wifi_ready("uid refresh") {
+            fetch_uids(self.gist_url)
+        } else {
+            Err(anyhow!("Wi-Fi is not ready"))
+        };
+
+        match fetch_result {
             Ok(uids) => {
                 info!("Loaded {} NFC identities from gist", uids.len());
                 self.uids = uids;
                 if let Err(err) = self.save_uids_cache() {
-                    warn!("failed to cache keys: {err}");
+                    warn!("failed to cache keys: {err:?}");
                 }
             }
             Err(fetch_err) => {
@@ -620,6 +655,104 @@ impl App {
         }
 
         Ok(self.uids.len())
+    }
+
+    fn ensure_wifi_ready(&mut self, reason: &str) -> bool {
+        let now = Instant::now();
+        match self.wifi.is_up() {
+            Ok(true) => {
+                if !self.wifi_was_up {
+                    info!("Wi-Fi netif recovered");
+                }
+                self.wifi_was_up = true;
+                self.wifi_connect_started = None;
+                self.wifi_reconnect_delay = Duration::from_secs(WIFI_RECONNECT_INITIAL_DELAY_SECS);
+                self.next_wifi_reconnect = now;
+                return true;
+            }
+            Ok(false) => {}
+            Err(err) => warn!("failed to query Wi-Fi netif state: {err:?}"),
+        }
+
+        if self.wifi_was_up {
+            warn!("Wi-Fi netif is down ({reason})");
+        }
+        self.wifi_was_up = false;
+
+        if self.wifi_connected_without_netif(now) {
+            return false;
+        }
+
+        if now >= self.next_wifi_reconnect {
+            self.request_wifi_reconnect(reason, now);
+        }
+
+        false
+    }
+
+    fn wifi_connected_without_netif(&mut self, now: Instant) -> bool {
+        let connected = match self.wifi.is_connected() {
+            Ok(connected) => connected,
+            Err(err) => {
+                warn!("failed to query Wi-Fi connection state: {err:?}");
+                false
+            }
+        };
+
+        if !connected {
+            return false;
+        }
+
+        let within_grace = self
+            .wifi_connect_started
+            .map(|started| started.elapsed() < Duration::from_secs(WIFI_CONNECTED_NETIF_GRACE_SECS))
+            .unwrap_or(false);
+
+        if within_grace {
+            return true;
+        }
+
+        warn!("Wi-Fi is associated but netif is down; disconnecting before retry");
+        if let Err(err) = self.wifi.wifi_mut().disconnect() {
+            warn!("Wi-Fi disconnect before retry failed: {err:?}");
+        }
+        self.wifi_connect_started = None;
+        self.next_wifi_reconnect = now + Duration::from_secs(1);
+        true
+    }
+
+    fn request_wifi_reconnect(&mut self, reason: &str, now: Instant) {
+        let delay = self.wifi_reconnect_delay;
+        self.next_wifi_reconnect = now + delay;
+        self.wifi_reconnect_delay = next_wifi_reconnect_delay(delay);
+
+        info!(
+            "requesting Wi-Fi reconnect ({reason}); next retry in {}s",
+            delay.as_secs()
+        );
+
+        match self.wifi.is_started() {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(err) = self.wifi.wifi_mut().start() {
+                    warn!("Wi-Fi start request failed: {err:?}");
+                    return;
+                }
+            }
+            Err(err) => warn!("failed to query Wi-Fi start state: {err:?}"),
+        }
+
+        match self.wifi.wifi_mut().connect() {
+            Ok(()) => {
+                self.wifi_connect_started = Some(now);
+                info!("Wi-Fi reconnect requested for SSID '{}'", self.wifi_ssid);
+            }
+            Err(err) => warn!(
+                "Wi-Fi reconnect request failed for SSID '{}': {err:?}",
+                self.wifi_ssid
+            ),
+        }
+        feed_watchdog();
     }
 
     fn save_uids_cache(&mut self) -> Result<()> {
@@ -694,6 +827,44 @@ impl App {
     }
 }
 
+fn subscribe_wifi_events(sys_loop: &EspSystemEventLoop) -> Result<EspSystemSubscription<'static>> {
+    let subscription = sys_loop.subscribe::<WifiEvent, _>(|event| match event {
+        WifiEvent::StaConnected(connected) => {
+            info!(
+                "Wi-Fi STA associated: ssid='{}', channel={}, auth={:?}, bssid={:02x?}",
+                String::from_utf8_lossy(connected.ssid()),
+                connected.channel(),
+                connected.authmode(),
+                connected.bssid()
+            );
+        }
+        WifiEvent::StaDisconnected(disconnected) => {
+            warn!(
+                "Wi-Fi STA disconnected: ssid='{}', reason={}, rssi={}, bssid={:02x?}",
+                String::from_utf8_lossy(disconnected.ssid()),
+                disconnected.reason(),
+                disconnected.rssi(),
+                disconnected.bssid()
+            );
+        }
+        WifiEvent::StaBeaconTimeout => warn!("Wi-Fi STA beacon timeout"),
+        _ => {}
+    })?;
+
+    Ok(subscription)
+}
+
+fn next_wifi_reconnect_delay(current: Duration) -> Duration {
+    let max = Duration::from_secs(WIFI_RECONNECT_MAX_DELAY_SECS);
+    let doubled = current.checked_mul(2).unwrap_or(max);
+
+    if doubled > max {
+        max
+    } else {
+        doubled
+    }
+}
+
 fn connect_wifi(
     wifi: &mut BlockingWifi<EspWifi<'static>>,
     ssid: &str,
@@ -705,15 +876,17 @@ fn connect_wifi(
         AuthMethod::WPA2Personal
     };
 
-    let mut client_conf = ClientConfiguration::default();
-    client_conf.ssid = ssid
-        .try_into()
-        .map_err(|_| anyhow!("SSID '{ssid}' is too long"))?;
-    client_conf.auth_method = auth_method;
-    client_conf.password = password
-        .try_into()
-        .map_err(|_| anyhow!("Wi-Fi password is too long"))?;
-    client_conf.channel = None;
+    let client_conf = ClientConfiguration {
+        ssid: ssid
+            .try_into()
+            .map_err(|_| anyhow!("SSID '{ssid}' is too long"))?,
+        auth_method,
+        password: password
+            .try_into()
+            .map_err(|_| anyhow!("Wi-Fi password is too long"))?,
+        channel: None,
+        ..Default::default()
+    };
 
     let wifi_configuration = Configuration::Client(client_conf);
 
@@ -761,7 +934,7 @@ fn send_telegram(bot_token: &str, message: &str, private: bool, log: bool) -> Re
                     break;
                 }
             }
-            Err(err) => return Err(anyhow!("http read error: {err}")),
+            Err(err) => return Err(anyhow!("http read error: {err:?}")),
         }
     }
 
@@ -787,19 +960,19 @@ fn fetch_uids(url: &str) -> Result<HashMap<String, String>> {
         match response.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => body.extend_from_slice(&buffer[..n]),
-            Err(err) => return Err(anyhow!("failed to read gist response: {err}")),
+            Err(err) => return Err(anyhow!("failed to read gist response: {err:?}")),
         }
     }
 
-    let parsed: HashMap<String, String> =
-        serde_json::from_slice(&body).map_err(|err| anyhow!("failed to parse gist json: {err}"))?;
+    let parsed: HashMap<String, String> = serde_json::from_slice(&body)
+        .map_err(|err| anyhow!("failed to parse gist json: {err:?}"))?;
 
     Ok(parsed)
 }
 
 fn unlock(uart: &UartDriver<'static>) -> Result<()> {
     uart.clear_rx()?;
-    let written = uart.write(&[b'u'])?;
+    let written = uart.write(b"u")?;
     if written != 1 {
         warn!("unexpected bytes written to unlock uart: {written}");
     }
